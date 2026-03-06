@@ -1,0 +1,561 @@
+openapi: 3.0.3
+info:
+  title: Palapa API
+  description: Backend API for Palapa — barter your GPU time with Palapa Computer Cluster.
+  version: 0.0.1
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: Health
+    description: Health-check and connectivity endpoints
+  - name: Keys
+    description: API key management
+  - name: Pricing
+    description: Model pricing tiers
+  - name: Compute Node
+    description: Compute node management and activity
+  - name: Inference
+    description: OpenAI-compatible inference
+
+components:
+  securitySchemes:
+    firebaseAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Firebase ID token obtained from Firebase Auth
+
+  schemas:
+    Error:
+      type: object
+      required: [status_code, error, message]
+      properties:
+        status_code:
+          type: integer
+        error:
+          type: string
+          description: Machine-readable error key
+        message:
+          type: string
+          description: Human-readable error message
+
+    ValidationError:
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            errors:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                  message:
+                    type: string
+
+    User:
+      type: object
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        name:
+          type: string
+
+    Tier:
+      type: object
+      properties:
+        name:
+          type: string
+          enum: [small, medium, large, extra_large]
+        token_cost:
+          type: integer
+        version:
+          type: integer
+
+    ActivityLog:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        model:
+          type: string
+        tokens:
+          type: integer
+        credits:
+          type: integer
+        bonus_multiplier:
+          type: number
+          description: Bonus multiplier (e.g. 1.5)
+        credits_with_bonus:
+          type: integer
+          description: Credits after bonus applied (rounded half up)
+        duration_ms:
+          type: integer
+
+    Stats:
+      type: object
+      properties:
+        balance:
+          type: integer
+        total_credits_spent:
+          type: integer
+        total_tokens:
+          type: integer
+        bonus_balance:
+          type: integer
+        bonus_expires_at:
+          type: string
+          format: date-time
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 401
+            error: unauthorized
+            message: Authorization header is required
+
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 400
+            error: bad-request
+            message: Missing required field
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 404
+            error: not-found
+            message: Resource not found
+
+    ServiceUnavailable:
+      description: Service temporarily unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 503
+            error: service-unavailable
+            message: Service is temporarily unavailable
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            status_code: 500
+            error: internal-server-error
+            message: An unexpected error occurred
+
+paths:
+  /hello-world:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns a hello world message. If a valid Bearer token is provided, also returns the user object.
+      operationId: helloWorld
+      security:
+        - firebaseAuth: []
+        - {}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [message]
+                properties:
+                  message:
+                    type: string
+                  user:
+                    $ref: "#/components/schemas/User"
+              examples:
+                unauthenticated:
+                  summary: Without auth token
+                  value:
+                    message: "Hello, World!"
+                authenticated:
+                  summary: With valid auth token
+                  value:
+                    message: "Hello, World!"
+                    user:
+                      user_id: "550e8400-e29b-41d4-a716-446655440000"
+                      email: "user@example.com"
+                      name: "Jane Doe"
+
+  /guest-key:
+    post:
+      tags: [Keys]
+      summary: Create a guest API key
+      operationId: createGuestKey
+      security:
+        - firebaseAuth: []
+      responses:
+        "201":
+          description: Guest key created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+              example:
+                status: success
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+    delete:
+      tags: [Keys]
+      summary: Delete a guest API key
+      operationId: deleteGuestKey
+      security:
+        - firebaseAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key]
+              properties:
+                api_key:
+                  type: string
+                  description: "The guest key to delete (format: {username}-{secret})"
+            example:
+              api_key: "janedoe-abcdefghijklmnopqrstuvwxy"
+      responses:
+        "200":
+          description: Guest key deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+              example:
+                status: success
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /personal-key:
+    post:
+      tags: [Keys]
+      summary: Create or replace the personal API key
+      description: Each user may have at most one personal key. Creating a new one replaces the existing key.
+      operationId: createPersonalKey
+      security:
+        - firebaseAuth: []
+      responses:
+        "201":
+          description: Personal key created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+              example:
+                status: success
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /pricing:
+    get:
+      tags: [Pricing]
+      summary: Get model pricing tiers
+      operationId: getPricing
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tiers:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Tier"
+              example:
+                tiers:
+                  - name: small
+                    token_cost: 1
+                    version: 1
+                  - name: medium
+                    token_cost: 2
+                    version: 1
+                  - name: large
+                    token_cost: 4
+                    version: 1
+                  - name: extra_large
+                    token_cost: 8
+                    version: 1
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /heartbeat:
+    post:
+      tags: [Compute Node]
+      summary: Register or keep alive a compute node
+      description: Upserts a compute node record. Pass `null` for `node_id` to register a new node.
+      operationId: computeHeartbeat
+      security:
+        - firebaseAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                node_id:
+                  type: string
+                  format: uuid
+                  nullable: true
+                  description: Existing node ID, or null to register a new node
+                models_loaded:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: Model IDs currently loaded in memory
+                models_stored:
+                  type: array
+                  items:
+                    type: string
+                    format: uuid
+                  description: Model IDs stored on disk
+                enabled_model_tiers:
+                  type: array
+                  items:
+                    type: string
+                    enum: [small, medium, large, extra_large]
+                  description: Tier names this node is willing to serve
+            example:
+              node_id: null
+              models_loaded: []
+              models_stored: ["550e8400-e29b-41d4-a716-446655440000"]
+              enabled_model_tiers: [small, medium]
+      responses:
+        "200":
+          description: Heartbeat acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id:
+                    type: string
+                    format: uuid
+              example:
+                node_id: "660e8400-e29b-41d4-a716-446655440000"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /inference-log:
+    get:
+      tags: [Compute Node]
+      summary: Get paginated activity log
+      description: Returns completed inference sessions for the authenticated user, ordered by most recent first. Supports cursor-based pagination.
+      operationId: getComputeActivity
+      security:
+        - firebaseAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Number of entries to return
+        - name: after
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Cursor — returns entries older than this timestamp
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ActivityLog"
+                  has_more:
+                    type: boolean
+              example:
+                entries:
+                  - timestamp: "2025-01-15T10:30:00Z"
+                    model: llama-3-8b
+                    tokens: 1234
+                    credits: 1234
+                    bonus_multiplier: 1.5
+                    credits_with_bonus: 1851
+                    duration_ms: 4200
+                has_more: true
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /stats:
+    get:
+      tags: [Compute Node]
+      summary: Get user usage statistics
+      description: Returns aggregate usage statistics for the authenticated user including balance, spending, and top models.
+      operationId: getComputeStats
+      security:
+        - firebaseAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Stats"
+              example:
+                balance: 50000
+                total_credits_spent: 12000
+                total_tokens: 98000
+                bonus_balance: 5000
+                bonus_expires_at: "2025-02-01T00:00:00Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /inference:
+    post:
+      tags: [Inference]
+      summary: Chat completion (OpenAI-compatible)
+      description: >
+        OpenAI-compatible chat completion endpoint. Validates the user's credit balance,
+        finds an available compute node, and streams back the response using server-sent events
+        in the same format as the OpenAI API.
+      operationId: createChatCompletion
+      security:
+        - firebaseAuth: []
+      requestBody:
+        description: OpenAI-compatible chat completion request body. Passed through to the compute node as-is.
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, messages]
+              properties:
+                model:
+                  type: string
+                  description: Name of the model to run inference on
+                messages:
+                  type: array
+                  items:
+                    type: object
+                  description: Chat messages in OpenAI format
+                stream:
+                  type: boolean
+                  default: true
+                  description: Must be true. Non-streaming is not supported.
+            example:
+              model: llama-3-8b
+              messages:
+                - role: user
+                  content: "Hello, how are you?"
+              stream: true
+      responses:
+        "200":
+          description: Streams back an OpenAI-compatible response as text/event-stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: Bad request — missing model or insufficient credits
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                missingModel:
+                  summary: Missing model field
+                  value:
+                    status_code: 400
+                    error: bad-request
+                    message: model is required
+                nonStreamingNotSupported:
+                  summary: Non-streaming not supported
+                  value:
+                    status_code: 400
+                    error: bad-request
+                    message: Non-streaming is not supported
+                insufficientCredits:
+                  summary: Insufficient credits
+                  value:
+                    status_code: 400
+                    error: bad-request
+                    message: Insufficient credits
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                status_code: 404
+                error: not-found
+                message: Model not found
+        "503":
+          description: No compute nodes available
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                status_code: 503
+                error: service-unavailable
+                message: No compute nodes available
